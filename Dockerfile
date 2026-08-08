@@ -1,8 +1,7 @@
 FROM rclone/rclone:1.75
 
 RUN apk add --no-cache bash curl fuse xz \
-    && addgroup -S app && adduser -S -G app app \
-    && addgroup app fuse
+    && addgroup -S app && adduser -S -G app app
 
 WORKDIR /app
 
