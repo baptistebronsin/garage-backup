@@ -1,0 +1,38 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_tag: ${{ steps.export-tag.outputs.image_tag }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Extract image tag
+        id: export-tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            IMAGE_TAG="latest"
+          fi
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build Docker image
+        run: docker build -t ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.export-tag.outputs.image_tag }} .
+
+      - name: Push Docker image
+        run: docker push ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.export-tag.outputs.image_tag }}
