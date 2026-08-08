@@ -52,7 +52,7 @@ export RCLONE_CONFIG_S3_ENDPOINT="${S3_ENDPOINT}"
 export RCLONE_CONFIG_S3_REGION="${S3_REGION}"
 export RCLONE_CONFIG_S3_FORCE_PATH_STYLE="true"
 
-# export RCLONE_CONFIG_S3_NO_CHECK_BUCKET="true"
+export RCLONE_CONFIG_S3_NO_CHECK_BUCKET="true"
 
 # ---------------------------------------------------------------------------
 # 3. PRE-FLIGHT CHECKS
