@@ -1,6 +1,6 @@
 FROM rclone/rclone:1.75
 
-RUN apk add --no-cache bash curl xz \
+RUN apk add --no-cache bash curl xz age \
     && addgroup -S app && adduser -S -G app app
 
 WORKDIR /app

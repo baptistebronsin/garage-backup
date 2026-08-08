@@ -15,6 +15,10 @@ set -o pipefail
 : "${S3_SECRET_ACCESS_KEY:?Missing variable S3_SECRET_ACCESS_KEY}"
 : "${S3_BUCKET:?Missing variable S3_BUCKET}"
 : "${DEST_PATH:=}"
+: "${BACKUP_MAX_BEFORE_DELETE:=}"
+
+# --- Encryption ---
+: "${BACKUP_AGE_RECIPIENT:=}" # age public key; leave empty to disable encryption
 
 # --- Compression ---
 : "${XZ_LEVEL:=6}"    # 0-9 (9 = maximum ratio, much slower/heavier)
@@ -60,6 +64,9 @@ export RCLONE_CONFIG_S3_NO_CHECK_BUCKET="true"
 command -v rclone >/dev/null 2>&1 || { echo "Error: rclone is not installed." >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "Error: tar is not installed." >&2; exit 1; }
 command -v xz >/dev/null 2>&1 || { echo "Error: xz is not installed." >&2; exit 1; }
+if [ -n "${BACKUP_AGE_RECIPIENT}" ]; then
+  command -v age >/dev/null 2>&1 || { echo "Error: age is not installed." >&2; exit 1; }
+fi
 
 # S3 requires rclone >= 1.59 (otherwise HTTP 401 errors)
 RCLONE_VER="$(rclone version | head -n1 | awk '{print $2}' | tr -d 'v')"
@@ -71,10 +78,15 @@ mkdir -p "${LOG_DIR}"
 TIMESTAMP="$(date +%Y-%m-%d_%H-%M-%S)"
 LOG_FILE="${LOG_DIR}/backup-${TIMESTAMP}.log"
 ARCHIVE_NAME="${TIMESTAMP}.tar.xz"
+if [ -n "${BACKUP_AGE_RECIPIENT}" ]; then
+  ARCHIVE_NAME="${ARCHIVE_NAME}.age"
+fi
 
 if [ -n "${DEST_PATH}" ]; then
+  DEST_DIR="s3:${S3_BUCKET}/${DEST_PATH%/}"
   DEST_OBJECT="${DEST_PATH%/}/${ARCHIVE_NAME}"
 else
+  DEST_DIR="s3:${S3_BUCKET}"
   DEST_OBJECT="${ARCHIVE_NAME}"
 fi
 
@@ -110,23 +122,40 @@ rclone copy "garage:${GARAGE_BUCKET}" "${SRC_DIR}" \
 # ---------------------------------------------------------------------------
 # 5. BACKUP
 #    Streams a single dated tar.xz archive of the downloaded bucket straight
-#    to the destination: tar (local dir) | xz | rclone rcat.
+#    to the destination: tar (local dir) | xz | [age] | rclone rcat.
 # ---------------------------------------------------------------------------
 echo "==> Starting backup to s3:${S3_BUCKET}/${DEST_OBJECT}"
 echo "    Log file: ${LOG_FILE}"
 
-tar -cf - -C "${SRC_DIR}" . \
-  | xz -T"${XZ_THREADS}" -"${XZ_LEVEL}" \
-  | rclone rcat "s3:${S3_BUCKET}/${DEST_OBJECT}" \
-      --log-file "${LOG_FILE}" \
-      --log-level INFO
+AGE_STATUS=0
+if [ -n "${BACKUP_AGE_RECIPIENT}" ]; then
+  echo "    Encryption: enabled (age)"
+  tar -cf - -C "${SRC_DIR}" . \
+    | xz -T"${XZ_THREADS}" -"${XZ_LEVEL}" \
+    | age -r "${BACKUP_AGE_RECIPIENT}" \
+    | rclone rcat "s3:${S3_BUCKET}/${DEST_OBJECT}" \
+        --log-file "${LOG_FILE}" \
+        --log-level INFO
 
-PIPE_STATUS=("${PIPESTATUS[@]}")
-TAR_STATUS="${PIPE_STATUS[0]}"
-XZ_STATUS="${PIPE_STATUS[1]}"
-RCAT_STATUS="${PIPE_STATUS[2]}"
+  PIPE_STATUS=("${PIPESTATUS[@]}")
+  TAR_STATUS="${PIPE_STATUS[0]}"
+  XZ_STATUS="${PIPE_STATUS[1]}"
+  AGE_STATUS="${PIPE_STATUS[2]}"
+  RCAT_STATUS="${PIPE_STATUS[3]}"
+else
+  tar -cf - -C "${SRC_DIR}" . \
+    | xz -T"${XZ_THREADS}" -"${XZ_LEVEL}" \
+    | rclone rcat "s3:${S3_BUCKET}/${DEST_OBJECT}" \
+        --log-file "${LOG_FILE}" \
+        --log-level INFO
 
-if [ "${TAR_STATUS}" -eq 0 ] && [ "${XZ_STATUS}" -eq 0 ] && [ "${RCAT_STATUS}" -eq 0 ]; then
+  PIPE_STATUS=("${PIPESTATUS[@]}")
+  TAR_STATUS="${PIPE_STATUS[0]}"
+  XZ_STATUS="${PIPE_STATUS[1]}"
+  RCAT_STATUS="${PIPE_STATUS[2]}"
+fi
+
+if [ "${TAR_STATUS}" -eq 0 ] && [ "${XZ_STATUS}" -eq 0 ] && [ "${AGE_STATUS}" -eq 0 ] && [ "${RCAT_STATUS}" -eq 0 ]; then
   STATUS=0
 else
   STATUS=1
@@ -139,13 +168,40 @@ if [ "${STATUS}" -eq 0 ]; then
   echo "==> Backup completed successfully: ${DEST_OBJECT}"
   rclone lsl "s3:${S3_BUCKET}/${DEST_OBJECT}" 2>/dev/null || true
 else
-  echo "==> Backup failed (tar=${TAR_STATUS}, xz=${XZ_STATUS}, rclone=${RCAT_STATUS}). Last log lines:" >&2
+  echo "==> Backup failed (tar=${TAR_STATUS}, xz=${XZ_STATUS}, age=${AGE_STATUS}, rclone=${RCAT_STATUS}). Last log lines:" >&2
   tail -n 30 "${LOG_FILE}" >&2
   exit "${STATUS}"
 fi
 
 # ---------------------------------------------------------------------------
-# 7. UPTIME
+# 7. BACKUP ROTATION
+#    Keeps only the BACKUP_MAX_BEFORE_DELETE most recent archives in
+#    DEST_DIR. Filenames sort lexicographically = chronologically
+#    (YYYY-MM-DD_HH-MM-SS.tar.xz), so no date parsing is needed.
+# ---------------------------------------------------------------------------
+if [ -z "${BACKUP_MAX_BEFORE_DELETE}" ]; then
+  echo "==> No limit on the number of backups to keep"
+else
+  echo "==> Rotating backups in ${DEST_DIR} (keeping ${BACKUP_MAX_BEFORE_DELETE} most recent)..."
+  OLD_BACKUPS="$(rclone lsf "${DEST_DIR}" --files-only --include "*.tar.xz*" \
+    | sort -r | tail -n "+$((BACKUP_MAX_BEFORE_DELETE + 1))")"
+
+  if [ -z "${OLD_BACKUPS}" ]; then
+    echo "==> No old backups to delete"
+  else
+    while IFS= read -r FILE_NAME; do
+      echo "==> Deleting ${FILE_NAME}..."
+      if rclone deletefile "${DEST_DIR}/${FILE_NAME}" --log-file "${LOG_FILE}" --log-level INFO; then
+        echo "    Deleted."
+      else
+        echo "    Error: failed to delete ${FILE_NAME}." >&2
+      fi
+    done <<< "${OLD_BACKUPS}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 8. UPTIME
 # ---------------------------------------------------------------------------
 if [ -n "${UPTIME_MONITORING_URL}" ]; then
   echo "==> Sending uptime monitoring ping to ${UPTIME_MONITORING_URL}"
