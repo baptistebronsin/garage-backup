@@ -108,10 +108,10 @@ rclone mount "garage:${GARAGE_BUCKET}" "${MOUNT_DIR}" \
   --daemon \
   --log-file "${LOG_FILE}" \
   --log-level INFO \
-  || { echo "Error: failed to mount the source Garage bucket." >&2; exit 1; }
+  || { echo "Error: failed to mount the source Garage bucket. Last log lines:" >&2; tail -n 30 "${LOG_FILE}" >&2; exit 1; }
 
 mountpoint -q "${MOUNT_DIR}" \
-  || { echo "Error: mount did not become ready." >&2; exit 1; }
+  || { echo "Error: mount did not become ready. Last log lines:" >&2; tail -n 30 "${LOG_FILE}" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 5. BACKUP
@@ -145,7 +145,8 @@ if [ "${STATUS}" -eq 0 ]; then
   echo "==> Backup completed successfully: ${DEST_OBJECT}"
   rclone lsl "s3:${S3_BUCKET}/${DEST_OBJECT}" 2>/dev/null || true
 else
-  echo "==> Backup failed (tar=${TAR_STATUS}, xz=${XZ_STATUS}, rclone=${RCAT_STATUS}). See ${LOG_FILE}." >&2
+  echo "==> Backup failed (tar=${TAR_STATUS}, xz=${XZ_STATUS}, rclone=${RCAT_STATUS}). Last log lines:" >&2
+  tail -n 30 "${LOG_FILE}" >&2
   exit "${STATUS}"
 fi
 
