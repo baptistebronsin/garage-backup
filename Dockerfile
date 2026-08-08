@@ -1,14 +1,12 @@
 FROM rclone/rclone:1.75
 
-RUN apk add --no-cache bash curl fuse xz
+RUN apk add --no-cache bash curl xz \
+    && addgroup -S app && adduser -S -G app app
 
 WORKDIR /app
 
 COPY --chmod=755 backup.sh /app/backup.sh
 
-ENTRYPOINT ["/app/backup.sh"]
+USER app
 
-# Requires: docker run --device /dev/fuse --cap-add SYS_ADMIN ...
-# (rclone mount needs FUSE access, which is not granted by default)
-# Runs as root: /dev/fuse is typically root-only (crw-------) on the host,
-# and CAP_SYS_ADMIN is already required for the mount itself.
+ENTRYPOINT ["/app/backup.sh"]

@@ -60,8 +60,6 @@ export RCLONE_CONFIG_S3_FORCE_PATH_STYLE="true"
 command -v rclone >/dev/null 2>&1 || { echo "Error: rclone is not installed." >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "Error: tar is not installed." >&2; exit 1; }
 command -v xz >/dev/null 2>&1 || { echo "Error: xz is not installed." >&2; exit 1; }
-command -v fusermount >/dev/null 2>&1 || { echo "Error: fusermount not found (fuse package required for 'rclone mount')." >&2; exit 1; }
-[ -e /dev/fuse ] || { echo "Error: /dev/fuse not found. Run the container with --device /dev/fuse --cap-add SYS_ADMIN." >&2; exit 1; }
 
 # S3 requires rclone >= 1.59 (otherwise HTTP 401 errors)
 RCLONE_VER="$(rclone version | head -n1 | awk '{print $2}' | tr -d 'v')"
@@ -89,39 +87,35 @@ rclone lsd "s3:${S3_BUCKET}" >/dev/null \
   || { echo "Error: cannot access the destination S3 bucket." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 4. MOUNT THE SOURCE BUCKET (FUSE, read-only, no local caching)
+# 4. DOWNLOAD THE SOURCE BUCKET LOCALLY (no special privileges required)
 # ---------------------------------------------------------------------------
-MOUNT_DIR="$(mktemp -d "${TMP_DIR}/garage-backup-mount.XXXXXX")"
+SRC_DIR="$(mktemp -d "${TMP_DIR}/garage-backup-src.XXXXXX")"
 
 cleanup() {
-  if mountpoint -q "${MOUNT_DIR}" 2>/dev/null; then
-    fusermount -u "${MOUNT_DIR}" 2>/dev/null || umount "${MOUNT_DIR}" 2>/dev/null || true
-  fi
-  rmdir "${MOUNT_DIR}" 2>/dev/null || true
+  rm -rf "${SRC_DIR}"
 }
 trap cleanup EXIT
 
-echo "==> Mounting garage:${GARAGE_BUCKET} on ${MOUNT_DIR}"
-rclone mount "garage:${GARAGE_BUCKET}" "${MOUNT_DIR}" \
-  --read-only \
-  --vfs-cache-mode off \
-  --daemon \
+echo "==> Downloading garage:${GARAGE_BUCKET} to ${SRC_DIR}"
+rclone copy "garage:${GARAGE_BUCKET}" "${SRC_DIR}" \
+  --transfers "${TRANSFERS}" \
+  --checkers "${CHECKERS}" \
+  --fast-list \
+  --stats 30s \
+  --stats-one-line \
   --log-file "${LOG_FILE}" \
   --log-level INFO \
-  || { echo "Error: failed to mount the source Garage bucket. Last log lines:" >&2; tail -n 30 "${LOG_FILE}" >&2; exit 1; }
-
-mountpoint -q "${MOUNT_DIR}" \
-  || { echo "Error: mount did not become ready. Last log lines:" >&2; tail -n 30 "${LOG_FILE}" >&2; exit 1; }
+  || { echo "Error: failed to download the source Garage bucket. Last log lines:" >&2; tail -n 30 "${LOG_FILE}" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 5. BACKUP
-#    Streams a single dated tar.xz archive of the whole bucket straight to
-#    the destination: tar (mount) | xz | rclone rcat. No local staging.
+#    Streams a single dated tar.xz archive of the downloaded bucket straight
+#    to the destination: tar (local dir) | xz | rclone rcat.
 # ---------------------------------------------------------------------------
 echo "==> Starting backup to s3:${S3_BUCKET}/${DEST_OBJECT}"
 echo "    Log file: ${LOG_FILE}"
 
-tar -cf - -C "${MOUNT_DIR}" . \
+tar -cf - -C "${SRC_DIR}" . \
   | xz -T"${XZ_THREADS}" -"${XZ_LEVEL}" \
   | rclone rcat "s3:${S3_BUCKET}/${DEST_OBJECT}" \
       --log-file "${LOG_FILE}" \
